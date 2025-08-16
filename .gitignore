@@ -50,9 +50,6 @@ tmp/
 .coverage
 coverage.xml
 htmlcov/
-__pycache__/
-llm-env/
-.env
 .env.variables/
 *.key
 *.json
@@ -60,16 +57,8 @@ llm-env/
 doc/
 # --- virtualenvs (必ず無視) ---
 win-venv/
-llm-env/
-.venv/
-venv/
 
 # ignore docs & venvs
-doc/
-win-venv/
-.venv/
-venv/
-llm-env/
 cloudflared.deb
 # Byte-compiled / optimized / DLL files
 agent_work/__pycache__/
