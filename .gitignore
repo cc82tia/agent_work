@@ -1,0 +1,73 @@
+# --- Secrets / 個人環境 ---
+.env
+.env.*        # 例: .env.bak, .env.local
+!.env.sample  # サンプルは残す
+
+# .env.variables 配下は原則コミットしない（.keep と *.sample だけ許可）
+.env.variables/*
+!.env.variables/.keep
+!.env.variables/*.sample
+
+# OAuth/Token/鍵
+tokens/
+.tokens/
+**/*token*.json
+**/*oauth*client*.json
+**/*private*key*.pem
+**/*private*key*.key
+
+# --- Python ビルド/キャッシュ ---
+__pycache__/
+*.py[cod]
+*.pyo
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.ipynb_checkpoints/
+
+# --- 仮想環境 ---
+llm-env/
+.venv/
+venv/
+.envrc
+.python-version
+
+# --- ログ/一時ファイル ---
+*.log
+logs/
+tmp/
+*.tmp
+*.swp
+.DS_Store
+
+# --- VSCode/IDE ---
+.vscode/*
+!.vscode/extensions.json
+!.vscode/settings.json
+.idea/
+
+# --- テスト生成物/カバレッジ ---
+.coverage
+coverage.xml
+htmlcov/
+__pycache__/
+llm-env/
+.env
+.env.variables/
+*.key
+*.json
+
+doc/
+# --- virtualenvs (必ず無視) ---
+win-venv/
+llm-env/
+.venv/
+venv/
+
+# ignore docs & venvs
+doc/
+win-venv/
+.venv/
+venv/
+llm-env/
+cloudflared.deb
