@@ -72,7 +72,7 @@ async def intent_endpoint(request: Request, x_bridge_secret: str | None = Header
     payload = await request.json()
     # route_intent は Google が無くても /data 保存は動く
     try:
-        result = await route_intent(payload, NOTES_FILE, EVENTS_FILE)
+        result = await route_intent(payload)
         return JSONResponse({"ok": True, "result": result})
     except Exception as e:
         # 5秒以内に返すため詳細はログに留める
