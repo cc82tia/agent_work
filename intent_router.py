@@ -1,83 +1,105 @@
-# intent_router.py  の add_note / add_event 内の末尾を以下に置き換え
+# intent_router.py
+# ------------------------------------------------------------
+# 概要  : 音声→テキストの命令を見分けて処理するルータ
+# 目的  : 最低限「note: …」「event: …」を /data に永続化する
+# 仕様  : Sheets / Calendar はまず "queued" にしておき、別処理で実行
+# 更新日: 2025-08-17
+# ------------------------------------------------------------
 
-from google.oauth2.credentials import Credentials
-from googleapiclient.discovery import build
-import os, json, datetime as dt
+from __future__ import annotations
 
-TOKEN_PATH = "/data/oauth/token.json"
-TIMEZONE   = os.getenv("GOOGLE_TIMEZONE", "Asia/Tokyo")
-SHEETS_ID  = os.getenv("SHEETS_ID")
-CAL_ID     = os.getenv("G_CALENDAR_ID") or os.getenv("GOOGLE_CALENDAR_ID") or "primary"
+import json
+from pathlib import Path
+from datetime import datetime, timezone
 
-def _load_creds() -> Credentials:
-    with open(TOKEN_PATH, "r", encoding="utf-8") as f:
-        data = json.load(f)
-    return Credentials(
-        token=data["token"],
-        refresh_token=data.get("refresh_token"),
-        token_uri=data["token_uri"],
-        client_id=data["client_id"],
-        client_secret=data["client_secret"],
-        scopes=data["scopes"],
-    )
+# ---- 共通ユーティリティ -------------------------------------------------
 
-def _append_to_sheets(text: str) -> str:
-    creds = _load_creds()
-    svc = build("sheets", "v4", credentials=creds)
-    values = [[dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S"), "memo", text]]
-    body = {"values": values}
-    svc.spreadsheets().values().append(
-        spreadsheetId=SHEETS_ID,
-        range=os.getenv("GOOGLE_SHEETS_RANGE", "Sheet1!A:C"),
-        valueInputOption="USER_ENTERED",
-        insertDataOption="INSERT_ROWS",
-        body=body
-    ).execute()
-    return "ok"
+def _utc_now_iso() -> str:
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
 
-def _insert_event(raw: str) -> str:
-    # ざっくり "8/20 14:00 タイトル" の形式を想定した簡易パース（必要に応じて強化）
-    try:
-        import re
-        m = re.search(r"(\d{1,2}/\d{1,2})\s+(\d{1,2}:\d{2})\s+(.+)", raw)
-        if not m:  # 失敗時は丸ごとタイトルで今から1時間枠
-            start = dt.datetime.now() + dt.timedelta(hours=1)
-            end   = start + dt.timedelta(hours=1)
-            summary = raw
-        else:
-            # 今年の日時にする
-            month, day = map(int, m.group(1).split("/"))
-            hour, minute = map(int, m.group(2).split(":"))
-            now = dt.datetime.now()
-            start = dt.datetime(now.year, month, day, hour, minute)
-            end   = start + dt.timedelta(hours=1)
-            summary = m.group(3)
+def _append_json_array(file_path: Path, obj: dict) -> None:
+    """
+    JSON配列ファイルにobjを追記する。ファイルが無ければ配列で新規作成。
+    """
+    file_path.parent.mkdir(parents=True, exist_ok=True)
+    if file_path.exists():
+        try:
+            data = json.loads(file_path.read_text(encoding="utf-8"))
+            if not isinstance(data, list):
+                data = []
+        except Exception:
+            data = []
+    else:
+        data = []
+    data.append(obj)
+    file_path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
 
-        creds = _load_creds()
-        svc = build("calendar", "v3", credentials=creds)
-        event = {
-            "summary": summary,
-            "start": {"dateTime": start.isoformat(), "timeZone": TIMEZONE},
-            "end":   {"dateTime": end.isoformat(),   "timeZone": TIMEZONE},
-        }
-        svc.events().insert(calendarId=CAL_ID, body=event).execute()
-        return "ok"
-    except Exception as e:
-        return f"error:{e}"
+# ---- 各ハンドラ ---------------------------------------------------------
 
-# --- add_note の最後をこうする ---
-# result = {"handled_by":"add_note", ... , "sheets":"queued"} を
-result = {
-    "handled_by":"add_note",
-    "saved_to":"/data/notes.json",
-    "note": note_obj,
-    "sheets": _append_to_sheets(note_obj["content"])
-}
+def add_note(content: str, store: str = "/data/notes.json") -> dict:
+    """
+    メモを /data/notes.json に追記するだけの最小実装。
+    Sheets 連携はここでは queued として返す。
+    """
+    note_obj = {
+        "type": "note",
+        "content": content.strip(),
+        "ts": _utc_now_iso(),
+    }
+    _append_json_array(Path(store), note_obj)
+    return {
+        "handled_by": "add_note",
+        "saved_to": store,
+        "note": note_obj,
+        "sheets": "queued",  # 後続ワーカーが拾う想定
+    }
 
-# --- add_event の最後をこうする ---
-result = {
-    "handled_by":"add_event",
-    "saved_to":"/data/events.json",
-    "event": ev_obj,
-    "calendar": _insert_event(ev_obj["raw"])
-}
+def add_event(raw: str, store: str = "/data/events.json") -> dict:
+    """
+    予定を /data/events.json に追記するだけの最小実装。
+    実カレンダー登録はここでは queued として返す。
+    """
+    event_obj = {
+        "type": "event",
+        "raw": raw.strip(),
+        "ts": _utc_now_iso(),
+    }
+    _append_json_array(Path(store), event_obj)
+    return {
+        "handled_by": "add_event",
+        "saved_to": store,
+        "event": event_obj,
+        "calendar": "queued",  # 後続ワーカーが拾う想定
+    }
+
+def echo(text: str) -> dict:
+    """
+    どれにも当てはまらない場合のフォールバック。
+    """
+    return {"handled_by": "echo", "echo": text}
+
+# ---- ルータ本体 ---------------------------------------------------------
+
+def route_intent(text: str, *args, **kwargs) -> dict:
+    """
+    音声テキストを受け取り、適切なハンドラに振り分ける。
+    可変引数/キーワードを受けることで、古い呼び出しシグネチャでも壊れないように後方互換にしている。
+    """
+    if not isinstance(text, str):
+        return {"handled_by": "error", "error": "text is not str"}
+
+    t = text.strip()
+    low = t.lower()
+
+    # "note: xxx" → メモ
+    if low.startswith("note:"):
+        content = t.split(":", 1)[1]
+        return add_note(content)
+
+    # "event: yyy" → 予定（詳細解析は後続のワーカーで）
+    if low.startswith("event:"):
+        raw = t.split(":", 1)[1]
+        return add_event(raw)
+
+    # それ以外は一旦エコー
+    return echo(t)
