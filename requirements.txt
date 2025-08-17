@@ -1,6 +1,5 @@
 annotated-types==0.7.0
 anyio==4.10.0
-backports.asyncio.runner==1.2.0
 cachetools==5.5.2
 certifi==2025.8.3
 cffi==1.17.1
@@ -58,3 +57,5 @@ uvicorn==0.35.0
 uvloop==0.21.0
 watchfiles==1.1.0
 websockets==15.0.1
+uvicorn[standard]==0.35.0
+# そのほか既存の依存はそのまま

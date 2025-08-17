@@ -52,7 +52,7 @@ coverage.xml
 htmlcov/
 .env.variables/
 *.key
-*.json
+# *.json
 
 doc/
 # --- virtualenvs (必ず無視) ---
@@ -269,3 +269,11 @@ agent_work/marimo/_lsp/
 agent_work/__marimo__/
 
 
+notes.json
++ data/*.json
++ **/*token*.json
++ **/*oauth*client*.json
++ service-account*.json
++ credentials.json
++ token.json
++ token.pickle

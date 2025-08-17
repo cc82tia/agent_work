@@ -13,7 +13,8 @@ from __future__ import annotations
 import os, json
 from typing import Any, Dict, Tuple
 from pathlib import Path
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
+
 
 # Google クライアント
 # ※ requirements.txt に以下が入っている想定

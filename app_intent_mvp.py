@@ -1,4 +1,13 @@
-# app_intent_mvp.py
+# file: app_intent_mvp.py
+# ------------------------------------------------------------
+# Intent Router MVP（JST固定 & Google共通認証）
+# - 既存の構成/関数名を最大限維持
+# - タイムゾーン: 常に Asia/Tokyo (+09:00) でCalendarへ登録
+# - memoはSheetsに追記
+# - X-Bridge-Secret等のゲートは既存のインフラ側で実施前提
+# - DRY_RUN=true なら外部APIは叩かずスタブ応答
+# ------------------------------------------------------------
+
 from fastapi import FastAPI, Body
 from fastapi.responses import JSONResponse, RedirectResponse
 import os, re, json
@@ -8,60 +17,48 @@ from pydantic import BaseModel
 from dotenv import load_dotenv
 from loguru import logger
 from pathlib import Path
-import httpx, asyncio
-
+import httpx
 
 # === 基本設定 ===
 load_dotenv(override=False)
-JST = timezone(timedelta(hours=9))
+JST = timezone(timedelta(hours=9))  # 既存方針を踏襲（ZoneInfo不要で+09:00固定）
 BASE_DIR = Path(__file__).parent
 
-# app_intent_mvp.py 共通スコープを定義
+# アプリのDRY_RUN制御（true=外部APIを叩かない）
+DRY_RUN = os.getenv("DRY_RUN", "true").lower() == "true"
+
+# Google APIで使う共通スコープ（Calendar + Sheets）
 SCOPES = [
     "https://www.googleapis.com/auth/calendar.events",
     "https://www.googleapis.com/auth/spreadsheets",
 ]
 
-# ※ Calendar でも Sheets でも、InstalledAppFlow / Credentials 生成時は必ず SCOPES を渡す
-#   例）flow = InstalledAppFlow.from_client_secrets_file(str(client_json), SCOPES)
-#       creds = flow.run_local_server(port=0)
+# ====== 日付/時刻ユーティリティ ======
 
+def jst_now() -> datetime:
+    """JSTの現在時刻（tz-aware）"""
+    return datetime.now(JST)
 
+def to_jst_iso(dt: datetime) -> str:
+    """
+    任意のdatetime（naive/tz-aware）をJSTに変換し、+09:00付きISO文字列にする。
+    naiveはUTCとみなさず、"JSTの時刻"として扱いたい場合はここでJST付与。
+    """
+    if dt.tzinfo is None:
+        # 既存の挙動：意図的に「JSTの時刻」として+09:00付与（UTC扱いにしない）
+        dt = dt.replace(tzinfo=JST)
+    return dt.astimezone(JST).isoformat(timespec="seconds")
 
-# DRY_RUN=false で実実行
-DRY_RUN = os.getenv("DRY_RUN", "true").lower() == "true"
+# ====== パス/ファイルユーティリティ ======
 
-import re
-import datetime as dt
-
-# 日本語→weekday番号（Mon=0 ... Sun=6）
-_JP_WD = {"月":0,"火":1,"水":2,"木":3,"金":4,"土":5,"日":6}
-
-def _next_week_same_weekday(base: dt.date, wd: int) -> dt.date:
-    """「来週X曜」を日付にする。ベース日から次週の同じ曜日を返す。"""
-    # 次の月曜（次週の頭）を求める
-    days_to_next_monday = (7 - base.weekday()) % 7 or 7
-    next_monday = base + dt.timedelta(days=days_to_next_monday)
-    return next_monday + dt.timedelta(days=wd)  # 次週のwd
-
-def _all_day_payload(date: dt.date, summary: str):
-    # Google Calendarの終日は end が翌日（exclusive）
-    return {
-        "summary": summary,
-        "start": {"date": date.isoformat()},
-        "end":   {"date": (date + dt.timedelta(days=1)).isoformat()},
-    }
-
-
-
-
-# ---- Helper: パス/内容の両対応 ----
 def _resolve_path(p: str) -> Path:
     pp = Path(p.strip())
     return pp if pp.is_absolute() else (BASE_DIR / pp).resolve()
 
 def _materialize_if_content(value: str|None, fname: str) -> Path|None:
-    if not value: return None
+    """環境変数がパスかJSON本文かの両対応。JSONはテンポラリに書き出してパス化。"""
+    if not value:
+        return None
     v = value.strip()
     p = _resolve_path(v)
     if p.exists():
@@ -72,8 +69,15 @@ def _materialize_if_content(value: str|None, fname: str) -> Path|None:
         return tmp
     return p
 
-# 👇 共通の資格情報取得：Calendar/Sheets の両方が必ず同じ token を使う
+# ====== Google 認証（Calendar/Sheetsで共通利用） ======
+
 def get_google_creds():
+    """
+    既存の Installed/Web クライアント両成分に配慮した共通クレデンシャル生成。
+    .env:
+      GOOGLE_OAUTH_CLIENT_JSON : client_secret のパス or JSON本文
+      GOOGLE_OAUTH_TOKEN_PATH  : token.json のパス（デフォ .env.variables/google_token.json）
+    """
     from google.oauth2.credentials import Credentials
     from google.auth.transport.requests import Request
 
@@ -84,9 +88,8 @@ def get_google_creds():
     if not client_json or not client_json.exists():
         raise RuntimeError("GOOGLE_OAUTH_CLIENT_JSON が見つかりません")
     if not token_file.exists():
-        raise RuntimeError("OAuth トークンがありません。先に `python token_setup.py` を実行して同意コードで発行してください。")
+        raise RuntimeError("OAuth トークンがありません。先に `python token_setup.py` で発行してください。")
 
-    import json
     raw = json.loads(token_file.read_text(encoding="utf-8"))
     cfg = json.loads(client_json.read_text(encoding="utf-8")).get("web", {})
     client_id = cfg.get("client_id"); client_secret = cfg.get("client_secret")
@@ -94,23 +97,11 @@ def get_google_creds():
     if not client_id or not client_secret:
         raise RuntimeError("client_secret.json が Webクライアント形式ではありません。『ウェブアプリ』で作り直してください。")
 
-    # ←← ここがポイント：expires_at(秒) があれば ISO8601 にして expiry に入れる 0815GPT提案上手くいかないからコメントアウト
-    # expiry_iso = None
-    # try:
-    #     ea = raw.get("expires_at")
-    #     if isinstance(ea, (int, float)) and ea > 0:
-    #         from datetime import datetime, timezone
-    #         expiry_iso = datetime.fromtimestamp(ea, tz=timezone.utc).isoformat()
-    # except Exception:
-    #     pass
-
-        # ←← ここがポイント：expires_at(秒) があれば RFC3339 "Z" 形式に
+    # expires_at(秒) → RFC3339Z へ（creds.valid判定の安定化）
     expiry_iso = None
     try:
         ea = raw.get("expires_at")
         if isinstance(ea, (int, float)) and ea > 0:
-            from datetime import datetime, timezone
-            # 例: 2025-08-15T09:12:34Z  ← コロン付きオフセットを避ける
             expiry_iso = datetime.fromtimestamp(ea, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     except Exception:
         pass
@@ -126,17 +117,13 @@ def get_google_creds():
         "token": raw.get("access_token"),
         "scopes": scopes or SCOPES,
         "token_uri": token_uri,
-        # ここを追加：有効期限が未来なら creds.valid になり refresh を走らせない
         "expiry": expiry_iso,
         "type": "authorized_user",
     }
     creds = Credentials.from_authorized_user_info(authorized_user, SCOPES)
 
-    # ネット不通で refresh 失敗させないための安全弁：
-    # expiry が設定され有効ならそのまま使い、期限切れ時だけ refresh を試みる
     if not creds.valid:
         if creds.expired and creds.refresh_token:
-            # ここでネット疎通が必要になる点に注意（長期運用はネット修復が必須）
             creds.refresh(Request())
             token_file.parent.mkdir(parents=True, exist_ok=True)
             token_file.write_text(creds.to_json(), encoding="utf-8")
@@ -146,19 +133,47 @@ def get_google_creds():
     _assert_token_has_scopes(creds)
     return creds
 
+def _assert_token_has_scopes(creds):
+    token_scopes = set(getattr(creds, "scopes", []) or [])
+    need = set(SCOPES)
+    if not need.issubset(token_scopes):
+        raise RuntimeError(
+            "トークンのスコープが不足しています。"
+            f"\n期待: {sorted(need)}"
+            f"\n実際: {sorted(token_scopes)}"
+            "\n→ `rm .env.variables/google_token.json` → `python token_setup.py` で再同意してください。"
+        )
 
-# === イントント判定 ===
+# ====== ルールベース意図判定 ======
+
 class IntentResult(BaseModel):
     intent: Literal["calendar","memo","unknown"]
     suggested_payload: Optional[Dict[str, Any]] = None
 
+# 日本語→weekday番号（Mon=0 ... Sun=6）
+_JP_WD = {"月":0,"火":1,"水":2,"木":3,"金":4,"土":5,"日":6}
+
+def _next_week_same_weekday(base_date, wd: int):
+    """「来週X曜」→ ベース日から次週の同曜"""
+    days_to_next_monday = (7 - base_date.weekday()) % 7 or 7
+    next_monday = base_date + timedelta(days=days_to_next_monday)
+    return next_monday + timedelta(days=wd)
+
+def _all_day_payload(date, summary: str):
+    """Google Calendarの終日は end が翌日（exclusive）"""
+    return {
+        "summary": summary,
+        "start": {"date": date.isoformat()},
+        "end":   {"date": (date + timedelta(days=1)).isoformat()},
+    }
+
 def _parse_relative_date(text: str) -> datetime:
-    now = datetime.now(JST)
+    now = jst_now().replace(hour=0, minute=0, second=0, microsecond=0)
     if any(k in text for k in ["明日","あした","tomorrow"]):
-        return (now+timedelta(days=1)).replace(hour=0,minute=0,second=0,microsecond=0)
+        return now + timedelta(days=1)
     if any(k in text for k in ["今日","きょう","today"]):
-        return now.replace(hour=0,minute=0,second=0,microsecond=0)
-    return now.replace(hour=0,minute=0,second=0,microsecond=0)
+        return now
+    return now
 
 def _extract_time(text: str) -> Tuple[int,int]:
     m = re.search(r'(\d{1,2})\s*時\s*(\d{1,2})?\s*分?', text)
@@ -178,53 +193,48 @@ def classify_intent_rule(text: str) -> IntentResult:
 
     # ① メモ → Sheets
     if any(k in t for k in ["メモ","日報","memo"]):
-        ts = datetime.now(JST).strftime("%Y-%m-%d %H:%M:%S")
+        ts = jst_now().strftime("%Y-%m-%d %H:%M:%S")
         body = re.sub(r'^(メモ[:：]?)', '', t).strip()
         return IntentResult(
             intent="memo",
             suggested_payload={"values": [[ts, "memo", body]]}
         )
 
-    # ② 「来週(◯)曜 … 終日 … 有休/休暇」→ カレンダー終日
+    # ② 来週X曜 + 終日 有休/休暇 → 終日
     m = re.search(r"(来週)?(?P<wd>[月火水木金土日])曜.*?(終日|全日).*(有休|休暇)", t)
     if m:
-        # ヘルパーはファイル上部で宣言済み：
-        # _JP_WD, _next_week_same_weekday, _all_day_payload
         wd = _JP_WD[m.group("wd")]
-        today = datetime.now(JST).date()
+        today = jst_now().date()
         if m.group(1):  # 「来週」
             target = _next_week_same_weekday(today, wd)
         else:
-            # 今週のその曜日（過ぎていれば翌週）
             days_ahead = (wd - today.weekday()) % 7
             target = today + timedelta(days=days_ahead)
-        return IntentResult(
-            intent="calendar",
-            suggested_payload=_all_day_payload(target, "有休")
-        )
+        return IntentResult(intent="calendar", suggested_payload=_all_day_payload(target, "有休"))
 
-    # ③ 時刻あり → カレンダー（デフォ30分）
+    # ③ 時刻あり → カレンダー（デフォ30分、JST固定）
     if "時" in t or re.search(r'\d{1,2}:\d{2}', t):
         base = _parse_relative_date(t)
         hh, mm = _extract_time(t)
         dur = _extract_duration(t)
-        start = base.replace(hour=hh, minute=mm)
-        end = start + timedelta(minutes=dur)
+        start_dt = base.replace(hour=hh, minute=mm)
+        end_dt = start_dt + timedelta(minutes=dur)
         title = re.sub(r'\d+時|\d+分|\d{1,2}:\d{2}|明日|今日|あした|に|から', '', t).strip() or "無題の予定"
+        # ここでは JSTのISO文字列をpayloadに格納（既存互換）
         return IntentResult(
             intent="calendar",
             suggested_payload={
                 "summary": title,
-                "start": start.strftime("%Y-%m-%dT%H:%M:%S+09:00"),
-                "end":   end.strftime("%Y-%m-%dT%H:%M:%S+09:00"),
+                "start": to_jst_iso(start_dt),
+                "end":   to_jst_iso(end_dt),
                 "description": ""
             }
         )
 
     return IntentResult(intent="unknown")
 
+# ====== LLMフォールバック（任意） ======
 
-# === LLMフォールバック（任意） ===
 def classify_intent_llm(text: str) -> Optional[IntentResult]:
     api_key = os.getenv("OPENAI_API_KEY")
     if not api_key:
@@ -245,36 +255,59 @@ def classify_intent_llm(text: str) -> Optional[IntentResult]:
         logger.warning(f"LLM fallback failed: {e}")
         return None
 
-# === Google Calendar（Calendar 登録（OAuthのみ） ===
+# ====== Google Calendar ======
+
+def build_calendar_event(payload: dict) -> dict:
+    """
+    安全なCalendarイベントbodyを構築。
+    - payload["start"/"end"] が str(ISO) でも datetime でも受付
+    - 常に Asia/Tokyo を明示
+    """
+    start_raw = payload["start"]
+    end_raw   = payload["end"]
+
+    if isinstance(start_raw, datetime):
+        start_iso = to_jst_iso(start_raw)
+    else:
+        start_iso = str(start_raw)
+
+    if isinstance(end_raw, datetime):
+        end_iso = to_jst_iso(end_raw)
+    else:
+        end_iso = str(end_raw)
+
+    return {
+        "summary": payload.get("summary","（無題）"),
+        "description": payload.get("description",""),
+        "start": {"dateTime": start_iso, "timeZone": "Asia/Tokyo"},
+        "end":   {"dateTime": end_iso,   "timeZone": "Asia/Tokyo"},
+    }
+
 def create_calendar_event(payload: dict) -> dict:
+    """Calendarへイベント作成（DRY_RUN対応）"""
     if DRY_RUN:
+        logger.info("[DRY_RUN] create_calendar_event %s", payload)
         return {"id":"dry_evt_123","link":"https://example.invalid","payload":payload,"dry_run":True}
 
     from googleapiclient.discovery import build
-    creds = get_google_creds()  # ← 共通化！
+    creds = get_google_creds()
     service = build("calendar", "v3", credentials=creds)
 
     calendar_id = os.getenv("GOOGLE_CALENDAR_ID", "primary")
-    event = {
-        "summary": payload["summary"],
-        "description": payload.get("description",""),
-        "start": {"dateTime": payload["start"]},
-        "end":   {"dateTime": payload["end"]},
-    }
-    created = service.events().insert(calendarId=calendar_id, body=event).execute()
+    body = build_calendar_event(payload)
+    created = service.events().insert(calendarId=calendar_id, body=body).execute()
     return {"id": created.get("id"), "link": created.get("htmlLink")}
 
+# ====== Google Sheets ======
 
-
-# === Google Sheets（OAuth; 同じトークンを使用） ===
-
-#Copilot提案～2段構えエラー文・標準化・logger統一
 def append_sheets(values) -> dict:
+    """Sheetsに2次元配列valuesを追記（DRY_RUN対応）"""
     if DRY_RUN:
+        logger.info("[DRY_RUN] append_sheets rows=%d", len(values))
         return {"ok": True, "updated": len(values), "dry_run": True}
 
     from googleapiclient.discovery import build
-    creds = get_google_creds()  # ← 共通化！
+    creds = get_google_creds()
     spreadsheet_id = os.getenv("SHEETS_ID")
     rng = os.getenv("GOOGLE_SHEETS_RANGE", "Sheet1!A:C")
     if not spreadsheet_id:
@@ -289,13 +322,14 @@ def append_sheets(values) -> dict:
     ).execute()
     return {"ok": True, "updated": res.get("updates", {}).get("updatedCells", 0)}
 
-# === FastAPI ===
+# ====== FastAPI ======
+
 app = FastAPI(title="Intent Router MVP")
 
 @app.get("/health")
 def health():
-    # Pydanticモデルは返してないのでシリアライズ問題なし
-    return {"status":"ok","dry_run":DRY_RUN}
+    # DRY_RUN状態も返す（運用確認しやすくする）
+    return {"status":"ok","dry_run":DRY_RUN,"tz":"+09:00"}
 
 @app.post("/intent/route")
 def route(payload: dict = Body(..., examples={"ex1":{"value":{"text":"明日12時に商談30分"}}})):
@@ -303,8 +337,8 @@ def route(payload: dict = Body(..., examples={"ex1":{"value":{"text":"明日12�
     res = classify_intent_rule(text)
     if res.intent == "unknown":
         llm = classify_intent_llm(text)
-        if llm: res = llm
-    # ここで .model_dump() にして返す（JSONシリアライズ対策）
+        if llm:
+            res = llm
     return JSONResponse({"ok":True,"text":text, **res.model_dump()})
 
 @app.get("/")
@@ -313,12 +347,19 @@ def root():
 
 @app.post("/execute")
 def execute(payload: dict = Body(..., examples={"ex1":{"value":{"text":"明日10時に商談30分"}}})):
+    """
+    - calendar: create_calendar_event
+    - memo:     append_sheets
+    - unknown:  400
+    例外時: 500 + 簡易メッセージ
+    """
     try:
         text = str(payload.get("text",""))
         result = classify_intent_rule(text)
         if result.intent == "unknown":
             llm = classify_intent_llm(text)
-            if llm: result = llm
+            if llm:
+                result = llm
 
         if result.intent == "calendar":
             created = create_calendar_event(result.suggested_payload)
@@ -331,29 +372,18 @@ def execute(payload: dict = Body(..., examples={"ex1":{"value":{"text":"明日10
 
     except Exception as e:
         logger.exception("execute failed")
-        # 例外メッセージだけ返す（Pydanticオブジェクトは返さない）
         return JSONResponse(
             {"ok": False, "hint": "外部API呼び出しでエラー。ログを確認してください。", "detail": str(e)},
             status_code=500
         )
 
+# ====== LINE WORKS（任意通知。失敗しても致命傷にしない） ======
 async def lw_notify(text: str) -> None:
     url = os.getenv("LINEWORKS_WEBHOOK_URL")
-    if not url: return
+    if not url:
+        return
     try:
         async with httpx.AsyncClient(timeout=3.0) as cli:
             await cli.post(url, json={"text": text})
     except Exception as e:
         logger.warning(f"LINE WORKS notify failed: {e}")
-
-
-def _assert_token_has_scopes(creds):
-    token_scopes = set(getattr(creds, "scopes", []) or [])
-    need = set(SCOPES)
-    if not need.issubset(token_scopes):
-        raise RuntimeError(
-            "トークンのスコープが不足しています。"
-            f"\n期待: {sorted(need)}"
-            f"\n実際: {sorted(token_scopes)}"
-            "\n→ `rm .env.variables/google_token.json` → `python token_setup.py` で再同意してください。"
-        )

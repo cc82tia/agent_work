@@ -1,0 +1,20 @@
+# file: tests/test_tz_jst.py
+from datetime import datetime
+from app_intent_mvp import build_calendar_event, to_jst_iso
+
+def test_to_jst_iso_naive():
+    dt = datetime(2025, 8, 20, 10, 0, 0)  # naive
+    s = to_jst_iso(dt)
+    assert s.endswith("+09:00")
+
+def test_build_calendar_event_jst_fields():
+    payload = {
+        "summary": "JSTテスト",
+        "start": datetime(2025, 8, 20, 10, 0, 0),
+        "end":   datetime(2025, 8, 20, 10, 30, 0),
+    }
+    ev = build_calendar_event(payload)
+    assert ev["start"]["timeZone"] == "Asia/Tokyo"
+    assert ev["end"]["timeZone"] == "Asia/Tokyo"
+    assert ev["start"]["dateTime"].endswith("+09:00")
+    assert ev["end"]["dateTime"].endswith("+09:00")
